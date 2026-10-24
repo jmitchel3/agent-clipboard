@@ -25,7 +25,7 @@ agent-clipboard gives every agent session one shared queue. Agents drop commands
 
 | How | What happens |
 | --- | --- |
-| **Toast** | A card pops up top-right when an agent queues something. Click it to copy. It stays until you use it or close it. |
+| **Toast** | A card pops up top-right when an agent queues something and stays until you use it. Click it to copy: it turns green and slowly fades. Hover to hold it, click again to re-copy, or hit ✕ to shatter it. |
 | **⌘⇧C** or click the menu bar icon | A Spotlight-style picker. The newest command is preselected, so **⌘⇧C ↩** copies it. |
 | **⌃⌥C** | Copies the newest command you haven't copied yet for the current project. No UI. |
 | **`ac`** in your terminal | Puts the newest command for this folder onto your zsh prompt, ready to edit or run. No clipboard involved. `ac 12` loads clip #12. |

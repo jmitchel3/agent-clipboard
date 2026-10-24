@@ -343,9 +343,34 @@ final class FloatingPanel: NSPanel {
     }
 }
 
-/// Lets the first click land on a panel that belongs to a background app.
+/// Lets the first click land on a panel that belongs to a background app, and reports hover even
+/// though this app is never active (SwiftUI's onHover only fires in the active app).
 final class ClickThroughHostingView<V: View>: NSHostingView<V> {
+    var onHover: ((Bool) -> Void)? { didSet { updateTrackingAreas() } }
+    private var hoverArea: NSTrackingArea?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        hoverArea = nil
+        guard onHover != nil else { return }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        if event.trackingArea === hoverArea { onHover?(true) }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if event.trackingArea === hoverArea { onHover?(false) }
+    }
 }
 
 func screenWithMouse() -> NSScreen {
@@ -652,83 +677,300 @@ final class PickerController {
 
 // MARK: - Toast
 
+final class ToastModel: ObservableObject {
+    enum Style { case pending, copied, info }
+    @Published var style = Style.info
+    @Published var title = ""
+    @Published var cmd = ""
+    @Published var note = ""
+    @Published var footer = ""
+    /// Brief green wash when a copied toast is clicked again.
+    @Published var flash = false
+}
+
 struct ToastView: View {
-    let title: String
-    let cmd: String
-    let note: String
-    let footer: String
-    var onClose: (() -> Void)?
+    @ObservedObject var model: ToastModel
+    var onClose: () -> Void
 
     var body: some View {
+        let copied = model.style == .copied
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Image(systemName: "doc.on.clipboard.fill").foregroundStyle(Color.accentColor)
-                Text(title).font(.system(size: 12, weight: .semibold))
+                Image(systemName: copied ? "checkmark.circle.fill" : "doc.on.clipboard.fill")
+                    .foregroundStyle(copied ? Color.green : Color.accentColor)
+                Text(model.title).font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(copied ? Color.green : Color.primary)
                 Spacer()
-                if let onClose {
+                if model.style != .info {
                     Button(action: onClose) {
                         Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
-            Text(cmd)
-                .font(.system(size: 12, design: .monospaced))
-                .lineLimit(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if !note.isEmpty {
-                Text(note).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+            if !model.cmd.isEmpty {
+                Text(model.cmd)
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if !footer.isEmpty {
-                Text(footer).font(.system(size: 10)).foregroundStyle(.tertiary)
+            if !model.note.isEmpty {
+                Text(model.note).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+            }
+            if !model.footer.isEmpty {
+                Text(model.footer).font(.system(size: 10)).foregroundStyle(.tertiary)
             }
         }
         .padding(12)
         .frame(width: 380, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.08)))
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.green.opacity(model.flash ? 0.25 : copied ? 0.08 : 0)))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(copied ? Color.green.opacity(0.7) : Color.primary.opacity(0.08), lineWidth: copied ? 1.5 : 1))
         .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.2), value: model.style)
+        .animation(.easeOut(duration: 0.25), value: model.flash)
     }
 }
 
+/// One toast that changes state in place: pending (sticky, offers a new clip), copied (green, fades
+/// slowly; hover holds it, click copies again), info (brief). ✕ shatters it.
 final class ToastController {
+    let model = ToastModel()
     let panel = FloatingPanel(focusable: false)
-    var dismiss: DispatchWorkItem?
     var onClick: (() -> Void)?
-    /// Clip a sticky toast is offering, so it can close once that clip is copied elsewhere.
+    /// Clip a pending toast is offering, so it can close once that clip is copied elsewhere.
     var clipID: Int?
+    private var host: ClickThroughHostingView<AnyView>?
+    private var timer: DispatchWorkItem?
+    /// Bumped on every state change so stale fade completions are ignored.
+    private var generation = 0
+    private var hovering = false
+    private var hold: Double?
+    private var fade = 0.0
+    private var shards: NSPanel?
 
-    /// `seconds: nil` keeps the toast up until it is clicked or closed.
-    func show(title: String, cmd: String, note: String = "", footer: String = "", seconds: Double?,
+    func show(_ style: ToastModel.Style, title: String, cmd: String, note: String = "", footer: String = "",
               clipID: Int? = nil, onClick: (() -> Void)? = nil) {
         self.onClick = onClick
-        self.clipID = clipID
-        let close: (() -> Void)? = seconds == nil ? { [weak self] in self?.hide() } : nil
-        let view = ToastView(title: title, cmd: cmd, note: note, footer: footer, onClose: close)
-            .onTapGesture { [weak self] in
-                let action = self?.onClick
-                self?.hide()
-                action?()
-            }
-        let host = ClickThroughHostingView(rootView: view)
-        panel.contentView = host
-        let size = host.fittingSize
-        let frame = screenWithMouse().visibleFrame
+        self.clipID = style == .pending ? clipID : nil
+        let wasCopied = panel.isVisible && model.style == .copied && style == .copied
+        model.style = style
+        model.title = title
+        model.cmd = cmd
+        model.note = note
+        model.footer = footer
+        switch style {
+        case .pending: (hold, fade) = (nil, 0)
+        case .copied: (hold, fade) = (1.5, 3.5)
+        case .info: (hold, fade) = (1.2, 0.6)
+        }
+        if wasCopied { pulse() }
+        present()
+        schedule()
+    }
+
+    private func present() {
+        if host == nil {
+            let view = ToastView(model: model) { [weak self] in self?.shatter() }
+                .onTapGesture { [weak self] in self?.onClick?() }
+            let h = ClickThroughHostingView(rootView: AnyView(view))
+            h.onHover = { [weak self] inside in self?.hover(inside) }
+            host = h
+            panel.contentView = h
+        }
+        host?.layoutSubtreeIfNeeded()
+        let size = host?.fittingSize ?? .zero
+        // Keep the top-right corner pinned while the height changes between states.
+        let screen = panel.isVisible ? (panel.screen ?? screenWithMouse()) : screenWithMouse()
+        let frame = screen.visibleFrame
         panel.setFrame(NSRect(x: frame.maxX - size.width - 14, y: frame.maxY - size.height - 10,
                               width: size.width, height: size.height), display: true)
+        panel.alphaValue = 1
         panel.orderFrontRegardless()
-        dismiss?.cancel()
-        guard let seconds else { return }
-        let work = DispatchWorkItem { [weak self] in self?.hide() }
-        dismiss = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    private func pulse() {
+        model.flash = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in self?.model.flash = false }
+    }
+
+    /// Hold fully visible, then fade out; hovering cancels and restarts it on exit.
+    private func schedule() {
+        generation += 1
+        timer?.cancel()
+        guard let hold, !hovering else { return }
+        let gen = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, gen == self.generation else { return }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = self.fade
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                self.panel.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                guard let self, gen == self.generation else { return }
+                self.hide()
+            })
+        }
+        timer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + hold, execute: work)
+    }
+
+    func hover(_ inside: Bool) {
+        hovering = inside
+        guard panel.isVisible, hold != nil else { return }
+        if inside {
+            generation += 1
+            timer?.cancel()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.15
+                panel.animator().alphaValue = 1
+            }
+        } else {
+            schedule()
+        }
     }
 
     func hide() {
-        dismiss?.cancel()
+        generation += 1
+        timer?.cancel()
         clipID = nil
+        onClick = nil
+        hovering = false
         panel.orderOut(nil)
         panel.contentView = nil
+        host = nil
+    }
+
+    // MARK: Shatter
+
+    /// Breaks the toast into glass shards that burst away from the ✕ and fall.
+    func shatter() {
+        guard panel.isVisible, let host, let image = snapshot(host) else { hide(); return }
+        let size = host.bounds.size
+        let pad: CGFloat = 260
+        let overlay = FloatingPanel(focusable: false)
+        overlay.ignoresMouseEvents = true
+        overlay.hasShadow = false
+        overlay.setFrame(panel.frame.insetBy(dx: -pad, dy: -pad), display: false)
+        let root = NSView(frame: NSRect(origin: .zero, size: overlay.frame.size))
+        root.wantsLayer = true
+        overlay.contentView = root
+        let scale = panel.backingScaleFactor
+
+        // Jittered grid, each cell split into two triangles.
+        let cols = 9, rows = 4
+        var pts: [[CGPoint]] = []
+        for r in 0...rows {
+            pts.append((0...cols).map { c in
+                let edgeX = c == 0 || c == cols, edgeY = r == 0 || r == rows
+                let jx = edgeX ? 0 : CGFloat.random(in: -0.35...0.35) * size.width / CGFloat(cols)
+                let jy = edgeY ? 0 : CGFloat.random(in: -0.35...0.35) * size.height / CGFloat(rows)
+                return CGPoint(x: CGFloat(c) * size.width / CGFloat(cols) + jx,
+                               y: CGFloat(r) * size.height / CGFloat(rows) + jy)
+            })
+        }
+        // ✕ sits top-right; layer space is y-up.
+        let impact = CGPoint(x: size.width - 20, y: size.height - 18)
+        var longest = 0.0
+        for r in 0..<rows {
+            for c in 0..<cols {
+                let a = pts[r][c], b = pts[r][c + 1], d = pts[r + 1][c], e = pts[r + 1][c + 1]
+                for tri in [[a, b, e], [a, e, d]] {
+                    longest = max(longest, addShard(tri, image: image, size: size, pad: pad, scale: scale,
+                                                    impact: impact, to: root.layer!))
+                }
+            }
+        }
+        panel.orderOut(nil)
+        overlay.orderFrontRegardless()
+        shards = overlay
+        let finish = { [weak self, weak overlay] in
+            overlay?.orderOut(nil)
+            if self?.shards === overlay { self?.shards = nil }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + longest + 0.05, execute: finish)
+        hide()
+    }
+
+    private func addShard(_ tri: [CGPoint], image: CGImage, size: CGSize, pad: CGFloat, scale: CGFloat,
+                          impact: CGPoint, to root: CALayer) -> Double {
+        let minX = tri.map(\.x).min()!, maxX = tri.map(\.x).max()!
+        let minY = tri.map(\.y).min()!, maxY = tri.map(\.y).max()!
+        let box = CGRect(x: minX, y: minY, width: max(maxX - minX, 1), height: max(maxY - minY, 1))
+
+        let shard = CALayer()
+        shard.frame = box.offsetBy(dx: pad, dy: pad)
+        let picture = CALayer()
+        picture.frame = CGRect(x: -box.minX, y: -box.minY, width: size.width, height: size.height)
+        picture.contents = image
+        picture.contentsScale = scale
+        shard.addSublayer(picture)
+        let mask = CAShapeLayer()
+        let path = CGMutablePath()
+        path.addLines(between: tri.map { CGPoint(x: $0.x - box.minX, y: $0.y - box.minY) })
+        path.closeSubpath()
+        mask.path = path
+        shard.mask = mask
+        root.addSublayer(shard)
+
+        let center = CGPoint(x: box.midX, y: box.midY)
+        var dx = center.x - impact.x, dy = center.y - impact.y
+        let dist = max(hypot(dx, dy), 1)
+        (dx, dy) = (dx / dist, dy / dist)
+        // Shards near the ✕ fly hardest.
+        let force = CGFloat.random(in: 90...170) * (1.4 - min(dist / size.width, 1))
+        let duration = Double.random(in: 0.55...0.85)
+        let start = shard.position
+        let end = CGPoint(x: start.x + dx * force * 1.6 + CGFloat.random(in: -20...20),
+                          y: start.y + dy * force * 0.6 - CGFloat.random(in: 120...220))
+
+        let move = CAKeyframeAnimation(keyPath: "position")
+        let arc = CGMutablePath()
+        arc.move(to: start)
+        arc.addQuadCurve(to: end, control: CGPoint(x: start.x + dx * force, y: start.y + max(dy, 0) * force + 30))
+        move.path = arc
+        move.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+        spin.toValue = CGFloat.random(in: -3...3)
+        let shrink = CABasicAnimation(keyPath: "transform.scale")
+        shrink.toValue = CGFloat.random(in: 0.5...0.85)
+        let vanish = CABasicAnimation(keyPath: "opacity")
+        vanish.fromValue = 1
+        vanish.toValue = 0
+        vanish.timingFunction = CAMediaTimingFunction(controlPoints: 0.6, 0, 1, 1)
+
+        let group = CAAnimationGroup()
+        group.animations = [move, spin, shrink, vanish]
+        group.duration = duration
+        group.fillMode = .forwards
+        group.isRemovedOnCompletion = false
+        shard.opacity = 0
+        shard.add(group, forKey: "shatter")
+        return duration
+    }
+
+    /// The material background doesn't render offscreen, so paint an opaque stand-in behind the content.
+    private func snapshot(_ view: NSView) -> CGImage? {
+        let bounds = view.bounds
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        view.cacheDisplay(in: bounds, to: rep)
+        let image = NSImage(size: bounds.size, flipped: false) { rect in
+            view.effectiveAppearance.performAsCurrentDrawingAppearance {
+                let shape = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 12, yRadius: 12)
+                NSColor.windowBackgroundColor.setFill()
+                shape.fill()
+                NSColor.separatorColor.setStroke()
+                shape.stroke()
+            }
+            rep.draw(in: rect)
+            return true
+        }
+        var rect = CGRect(origin: .zero, size: bounds.size)
+        return image.cgImage(forProposedRect: &rect, context: nil,
+                             hints: [.ctm: AffineTransform(scale: view.window?.backingScaleFactor ?? 2)])
     }
 }
 
@@ -823,9 +1065,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if toastsEnabled, let row = fresh.last {
             let more = fresh.count > 1 ? "  (+\(fresh.count - 1) more)" : ""
-            toast.show(title: "\(row.project) · #\(row.id)\(more)", cmd: row.cmd, note: row.note,
-                       footer: "Click to copy  ·  ⌘⇧C picker  ·  ⌃⌥C copy newest", seconds: nil,
-                       clipID: row.id) { [weak self] in
+            toast.show(.pending, title: "\(row.project) · #\(row.id)\(more)", cmd: row.cmd, note: row.note,
+                       footer: "Click to copy  ·  ⌘⇧C picker  ·  ⌃⌥C copy newest", clipID: row.id) { [weak self] in
                 if let cmd = copyClip(id: row.id) { self?.confirmCopy(row.id, cmd) }
             }
         }
@@ -842,7 +1083,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func confirmCopy(_ id: Int, _ cmd: String) {
         refreshBadge()
-        toast.show(title: "Copied #\(id)", cmd: cmd, seconds: 1.6)
+        let row = store.rows.first { $0.id == id }
+        let project = row.map { " · \($0.project)" } ?? ""
+        toast.show(.copied, title: "Copied #\(id)\(project)", cmd: cmd, note: row?.note ?? "",
+                   footer: "Click to copy again") { [weak self] in
+            if let cmd = copyClip(id: id) { self?.confirmCopy(id, cmd) }
+        }
     }
 
     /// Left click opens the picker; right or ⌃-click shows the settings menu.
@@ -881,7 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.refresh()
         let shown = visibleRows
         guard let row = shown.last(where: { !$0.copied }) ?? shown.last else {
-            toast.show(title: "Nothing queued", cmd: filter == allProjects ? "" : filter, seconds: 1.6)
+            toast.show(.info, title: "Nothing queued", cmd: filter == allProjects ? "" : filter)
             return
         }
         if let cmd = copyClip(id: row.id) { confirmCopy(row.id, cmd) }
