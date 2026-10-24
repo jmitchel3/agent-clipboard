@@ -30,7 +30,7 @@ agent-clipboard gives every agent session one shared queue. Agents drop commands
 | **⌃⌥C** | Copies the newest command you haven't copied yet for the current project. No UI. |
 | **`ac`** in your terminal | Puts the newest command for this folder onto your zsh prompt, ready to edit or run. No clipboard involved. `ac 12` loads clip #12. |
 
-Inside the picker:
+Inside the picker (each row shows its clip id, the `#12` agents tell you about):
 
 | Key | Action |
 | --- | --- |
@@ -38,7 +38,7 @@ Inside the picker:
 | `⌘1` to `⌘9` | copy that row |
 | `⌥↩` | archive (hide from the list; it stays in the log) |
 | `←` `→` / `tab` | switch project tab (arrows work while the search box is empty) |
-| type | search commands, notes and projects |
+| type | search commands, notes and projects; `34` or `#34` jumps to clip #34 in any project |
 | `esc` | close |
 
 Right-click the menu bar icon for settings: project filter, toast on/off, bulk archive, open the log.

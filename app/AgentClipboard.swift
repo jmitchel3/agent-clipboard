@@ -276,6 +276,9 @@ final class PickerModel: ObservableObject {
         let scoped = rows.filter { scope == nil || $0.project == scope }
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return Array(scoped.prefix(50)) }
+        if let id = Int(q.hasPrefix("#") ? String(q.dropFirst()) : q), let hit = rows.first(where: { $0.id == id }) {
+            return [hit]
+        }
         return Array(scoped.filter {
             $0.cmd.localizedCaseInsensitiveContains(q) || $0.note.localizedCaseInsensitiveContains(q)
                 || $0.project.localizedCaseInsensitiveContains(q)
@@ -296,10 +299,10 @@ struct RowView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(index < 9 ? "\(index + 1)" : " ")
+            Text("#\(row.id)")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
-                .frame(width: 14)
+                .frame(minWidth: 34, alignment: .trailing)
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 3) {
                 Text(row.cmd)
@@ -312,6 +315,8 @@ struct RowView: View {
                     if !row.note.isEmpty { Text(row.note) }
                     Text(row.age)
                     if row.copied { Image(systemName: "checkmark") }
+                    Spacer(minLength: 0)
+                    if index < 9 { Text("⌘\(index + 1)").font(.system(size: 10, design: .monospaced)) }
                 }
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
@@ -780,7 +785,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let cmd = (clip["cmd"] as? String) ?? ""
             let project = (clip["project"] as? String) ?? ""
             let note = (clip["note"] as? String) ?? ""
-            let prefix = filter == allProjects ? "[\(project)]  " : ""
+            let prefix = "#\(clipID(clip))  " + (filter == allProjects ? "[\(project)]  " : "")
 
             let item = NSMenuItem(title: prefix + preview(cmd), action: #selector(copyMenuClip(_:)), keyEquivalent: "")
             item.target = self
