@@ -29,83 +29,198 @@ func withLock<T>(_ body: () -> T) -> T {
     return body()
 }
 
-func loadClips() -> [Clip] {
-    guard let text = try? String(contentsOf: storeURL, encoding: .utf8) else { return [] }
-    return text.split(separator: "\n").compactMap { line in
-        guard let data = line.data(using: .utf8) else { return nil }
-        return (try? JSONSerialization.jsonObject(with: data)) as? Clip
+/// One line of clips.jsonl. Lines that don't parse are written back verbatim, never dropped.
+struct StoreLine {
+    var raw: String
+    var clip: Clip?
+}
+
+/// `match` limits JSON parsing to lines that could be relevant; the rest stay raw.
+func loadLines(parsing match: (String) -> Bool = { _ in true }) -> [StoreLine] {
+    guard let data = try? Data(contentsOf: storeURL) else { return [] }
+    return data.split(separator: UInt8(ascii: "\n")).compactMap { slice in
+        let raw = String(decoding: slice, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        let clip = match(raw) ? (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? Clip : nil
+        return StoreLine(raw: raw, clip: clip)
     }
 }
 
-func saveClips(_ clips: [Clip]) {
-    let lines = clips.compactMap { c -> String? in
-        guard let d = try? JSONSerialization.data(withJSONObject: c, options: [.withoutEscapingSlashes]) else { return nil }
-        return String(data: d, encoding: .utf8)
-    }
+func saveLines(_ lines: [StoreLine]) {
+    var text = ""
+    text.reserveCapacity(lines.reduce(0) { $0 + $1.raw.utf8.count + 1 })
+    for l in lines { text += l.raw; text += "\n" }
     let tmp = storeDir.appendingPathComponent("clips.tmp")
-    try? (lines.joined(separator: "\n") + "\n").write(to: tmp, atomically: false, encoding: .utf8)
+    guard (try? text.write(to: tmp, atomically: false, encoding: .utf8)) != nil else { return }
     _ = rename(tmp.path, storeURL.path)
 }
 
-/// Load, mutate, and save under the shared lock.
-func mutate(_ body: (inout [Clip]) -> Void) {
+/// Load, mutate the clips with these ids, and save, all under the shared lock. Only lines that
+/// mention one of the ids are parsed; everything else is copied through untouched.
+@discardableResult
+func mutate(ids: Set<Int>, _ body: (inout Clip) -> Void) -> [Clip] {
     withLock {
-        var clips = loadClips()
-        body(&clips)
-        saveClips(clips)
+        let needles = ids.count <= 32 ? ids.map(String.init) : nil
+        var lines = loadLines { raw in needles?.contains { raw.contains($0) } ?? true }
+        var changed: [Clip] = []
+        for i in lines.indices {
+            guard var c = lines[i].clip, ids.contains(clipID(c)) else { continue }
+            body(&c)
+            guard let d = try? JSONSerialization.data(withJSONObject: c, options: [.withoutEscapingSlashes]),
+                  let raw = String(data: d, encoding: .utf8) else { continue }
+            lines[i] = StoreLine(raw: raw, clip: c)
+            changed.append(c)
+        }
+        if !changed.isEmpty { saveLines(lines) }
+        return changed
     }
 }
 
 func clipID(_ c: Clip) -> Int { (c["id"] as? NSNumber)?.intValue ?? -1 }
-func isArchived(_ c: Clip) -> Bool { (c["archived"] as? Bool) ?? false }
 func copyCount(_ c: Clip) -> Int { (c["copies"] as? [Any])?.count ?? 0 }
 
-@discardableResult
-func run(_ path: String, _ args: [String]) -> String {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = args
-    let out = Pipe()
-    p.standardOutput = out
-    p.standardError = FileHandle.nullDevice
-    do { try p.run() } catch { return "" }
-    let data = out.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+/// A real `"archived": true` key; inside a JSON string the quotes would be escaped, so this can't
+/// match command text. Lets the store skip parsing archived lines, which are most of the log.
+func isArchivedLine(_ raw: String) -> Bool {
+    raw.contains("\"archived\":true") || raw.contains("\"archived\": true")
 }
 
-var projectCache: [String: String] = [:]
-let projectCacheLock = NSLock()
+/// In-memory view of the non-archived clips, reparsed only when the file actually changes.
+final class ClipStore {
+    private(set) var rows: [ClipRow] = []
+    private var stamp: [Int] = []
+
+    /// Returns true if the file changed since the last call.
+    @discardableResult
+    func refresh() -> Bool {
+        var st = stat()
+        let now = stat(storeURL.path, &st) == 0
+            ? [Int(st.st_ino), Int(st.st_size), st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec] : []
+        guard now != stamp else { return false }
+        stamp = now
+        rows = loadLines { !isArchivedLine($0) }.compactMap { line in
+            guard let c = line.clip, (c["archived"] as? Bool) != true, clipID(c) >= 0 else { return nil }
+            return ClipRow(c)
+        }
+        return true
+    }
+}
+
+/// Watches the store directory (atomic renames) and the file itself (appends) with kqueue,
+/// so the app sleeps until something writes instead of polling.
+final class StoreWatcher {
+    private var dirSource: DispatchSourceFileSystemObject?
+    private var fileSource: DispatchSourceFileSystemObject?
+    private var scheduled = false
+    private let onChange: () -> Void
+
+    init(onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        try? FileManager.default.createDirectory(at: storeDir, withIntermediateDirectories: true)
+        dirSource = watch(storeDir.path, [.write]) { [weak self] in self?.changed() }
+        watchFile()
+    }
+
+    private func watch(_ path: String, _ mask: DispatchSource.FileSystemEvent,
+                       _ handler: @escaping () -> Void) -> DispatchSourceFileSystemObject? {
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return nil }
+        let s = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: mask, queue: .main)
+        s.setEventHandler(handler: handler)
+        s.setCancelHandler { close(fd) }
+        s.resume()
+        return s
+    }
+
+    /// Re-armed on every event: a rename replaces the inode the old source was watching.
+    private func watchFile() {
+        fileSource?.cancel()
+        fileSource = watch(storeURL.path, [.write, .extend, .delete, .rename]) { [weak self] in self?.changed() }
+    }
+
+    private func changed() {
+        watchFile()
+        guard !scheduled else { return }
+        scheduled = true
+        // Coalesce the burst of events one write produces.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            self?.scheduled = false
+            self?.onChange()
+        }
+    }
+}
+
+func realPath(_ path: String) -> String {
+    guard let r = realpath(path, nil) else { return path }
+    defer { free(r) }
+    return String(cString: r)
+}
+
+/// What `git rev-parse --git-common-dir` prints, read straight from .git (no git process).
+func gitCommonDir(from dir: String) -> String? {
+    let fm = FileManager.default
+    var url = URL(fileURLWithPath: dir)
+    while true {
+        let dotgit = url.appendingPathComponent(".git")
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: dotgit.path, isDirectory: &isDir) {
+            if isDir.boolValue {
+                if fm.fileExists(atPath: dotgit.appendingPathComponent("HEAD").path) { return dotgit.path }
+            } else if let text = try? String(contentsOf: dotgit, encoding: .utf8), text.hasPrefix("gitdir:") {
+                let path = text.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
+                let gitdir = path.hasPrefix("/") ? URL(fileURLWithPath: path) : url.appendingPathComponent(path)
+                if fm.fileExists(atPath: gitdir.appendingPathComponent("HEAD").path) {
+                    guard let common = try? String(contentsOf: gitdir.appendingPathComponent("commondir"), encoding: .utf8)
+                    else { return gitdir.path }
+                    let c = common.trimmingCharacters(in: .newlines)
+                    return c.hasPrefix("/") ? c : gitdir.appendingPathComponent(c).path
+                }
+            }
+        }
+        let parent = url.deletingLastPathComponent()
+        if parent.path == url.path { return nil }
+        url = parent
+    }
+}
 
 /// Same rule as the CLI: git repo name (worktrees resolve to the main repo), else the folder name.
-/// Cached per directory so repeat lookups skip spawning git.
 func projectName(forDirectory dir: String) -> String {
-    projectCacheLock.lock()
-    let cached = projectCache[dir]
-    projectCacheLock.unlock()
-    if let cached { return cached }
-    let common = run("/usr/bin/git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"])
-    let name = common.isEmpty ? URL(fileURLWithPath: dir).lastPathComponent
-        : URL(fileURLWithPath: common).deletingLastPathComponent().lastPathComponent
-    projectCacheLock.lock()
-    projectCache[dir] = name
-    projectCacheLock.unlock()
-    return name
+    guard let common = gitCommonDir(from: dir) else { return URL(fileURLWithPath: dir).lastPathComponent }
+    return URL(fileURLWithPath: realPath(common)).deletingLastPathComponent().lastPathComponent
 }
 
-/// Compiled once; reused on every lookup. Must run on the main thread.
-let ttyScript: NSAppleScript? = {
-    let s = NSAppleScript(source: "tell application \"Terminal\" to get tty of selected tab of front window")
-    var err: NSDictionary?
-    s?.compileAndReturnError(&err)
-    return s
+func fourCC(_ s: String) -> FourCharCode { s.utf8.reduce(0) { $0 << 8 | FourCharCode($1) } }
+
+func objectSpecifier(_ want: String, in container: NSAppleEventDescriptor, form: String,
+                     _ data: NSAppleEventDescriptor) -> NSAppleEventDescriptor {
+    let rec = NSAppleEventDescriptor.record()
+    rec.setDescriptor(NSAppleEventDescriptor(typeCode: fourCC(want)), forKeyword: AEKeyword(keyAEDesiredClass))
+    rec.setDescriptor(container, forKeyword: AEKeyword(keyAEContainer))
+    rec.setDescriptor(NSAppleEventDescriptor(enumCode: fourCC(form)), forKeyword: AEKeyword(keyAEKeyForm))
+    rec.setDescriptor(data, forKeyword: AEKeyword(keyAEKeyData))
+    return rec.coerce(toDescriptorType: DescType(typeObjectSpecifier)) ?? rec
+}
+
+/// `get tty of selected tab of front window` as a raw Apple Event. Same answer and permission as the
+/// AppleScript, without loading the AppleScript interpreter (about 15 MB and 50 ms on first use).
+let ttyEvent: NSAppleEventDescriptor = {
+    let window = objectSpecifier("cwin", in: .null(), form: "indx", NSAppleEventDescriptor(int32: 1))
+    let tab = objectSpecifier("prop", in: window, form: "prop", NSAppleEventDescriptor(typeCode: fourCC("tcnt")))
+    let tty = objectSpecifier("prop", in: tab, form: "prop", NSAppleEventDescriptor(typeCode: fourCC("ttty")))
+    let event = NSAppleEventDescriptor(eventClass: AEEventClass(kAECoreSuite), eventID: AEEventID(kAEGetData),
+                                       targetDescriptor: NSAppleEventDescriptor(bundleIdentifier: "com.apple.Terminal"),
+                                       returnID: AEReturnID(kAutoGenerateReturnID),
+                                       transactionID: AETransactionID(kAnyTransactionID))
+    event.setParam(tty, forKeyword: AEKeyword(keyDirectObject))
+    return event
 }()
 
 /// tty of the front Terminal.app tab, if Terminal is frontmost.
 func frontTerminalTTY() -> String? {
-    guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" else { return nil }
-    var err: NSDictionary?
-    guard let tty = ttyScript?.executeAndReturnError(&err).stringValue, tty.hasPrefix("/dev/") else { return nil }
+    guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal",
+          let reply = try? ttyEvent.sendEvent(options: [.waitForReply], timeout: 1),
+          let tty = reply.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+          tty.hasPrefix("/dev/") else { return nil }
     return tty
 }
 
@@ -145,14 +260,9 @@ func preview(_ cmd: String, width: Int = 60) -> String {
 /// Copies a clip to the pasteboard and records the copy in the log.
 @discardableResult
 func copyClip(id: Int) -> String? {
-    var cmd: String?
-    mutate { clips in
-        guard let i = clips.firstIndex(where: { clipID($0) == id }) else { return }
-        cmd = clips[i]["cmd"] as? String
-        var copies = (clips[i]["copies"] as? [Any]) ?? []
-        copies.append(Date().timeIntervalSince1970)
-        clips[i]["copies"] = copies
-    }
+    let cmd = mutate(ids: [id]) { c in
+        c["copies"] = ((c["copies"] as? [Any]) ?? []) + [Date().timeIntervalSince1970]
+    }.first?["cmd"] as? String
     if let cmd {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(cmd, forType: .string)
@@ -161,9 +271,7 @@ func copyClip(id: Int) -> String? {
 }
 
 func archiveClips(_ ids: Set<Int>) {
-    mutate { clips in
-        for i in clips.indices where ids.contains(clipID(clips[i])) { clips[i]["archived"] = true }
-    }
+    mutate(ids: ids) { $0["archived"] = true }
 }
 
 struct ClipRow: Identifiable {
@@ -172,7 +280,8 @@ struct ClipRow: Identifiable {
     let project: String
     let note: String
     let ts: Double
-    let copied: Bool
+    let copies: Int
+    var copied: Bool { copies > 0 }
 
     init(_ c: Clip) {
         id = clipID(c)
@@ -180,7 +289,7 @@ struct ClipRow: Identifiable {
         project = (c["project"] as? String) ?? ""
         note = (c["note"] as? String) ?? ""
         ts = (c["ts"] as? NSNumber)?.doubleValue ?? 0
-        copied = copyCount(c) > 0
+        copies = copyCount(c)
     }
 
     var age: String {
@@ -247,23 +356,22 @@ func screenWithMouse() -> NSScreen {
 // MARK: - Picker (⌘⇧C)
 
 final class PickerModel: ObservableObject {
-    @Published var query = "" { didSet { selection = 0 } }
+    @Published var query = "" { didSet { refilter() } }
     @Published var selection = 0
     /// Project being shown; nil means all projects.
-    @Published var scope: String? { didSet { selection = 0 } }
-    @Published var rows: [ClipRow] = []
-    /// Project of the front Terminal tab, pinned first in the tab strip.
-    var home: String?
-
+    @Published var scope: String? { didSet { refilter() } }
+    /// Filtered rows for the current scope and query, recomputed only when one of those changes.
+    @Published private(set) var items: [ClipRow] = []
     /// Home first, then projects by most recent clip, then All (nil).
-    var scopes: [String?] {
-        var names: [String] = home.map { [$0] } ?? []
-        for r in rows where !names.contains(r.project) { names.append(r.project) }
-        return names.map { Optional($0) } + [nil]
-    }
+    @Published private(set) var scopes: [String?] = [nil]
+    /// Project of the front Terminal tab, pinned first in the tab strip.
+    var home: String? { didSet { rebuildScopes() } }
+    private var rows: [ClipRow] = []
+    private var pendingByProject: [String: Int] = [:]
+    private var pendingTotal = 0
 
     func pending(_ scope: String?) -> Int {
-        rows.filter { !$0.copied && (scope == nil || $0.project == scope) }.count
+        scope.map { pendingByProject[$0] ?? 0 } ?? pendingTotal
     }
 
     func step(_ delta: Int) {
@@ -272,22 +380,42 @@ final class PickerModel: ObservableObject {
         scope = all[(i + delta + all.count) % all.count]
     }
 
-    var items: [ClipRow] {
-        let scoped = rows.filter { scope == nil || $0.project == scope }
-        let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return Array(scoped.prefix(50)) }
-        if let id = Int(q.hasPrefix("#") ? String(q.dropFirst()) : q), let hit = rows.first(where: { $0.id == id }) {
-            return [hit]
-        }
-        return Array(scoped.filter {
-            $0.cmd.localizedCaseInsensitiveContains(q) || $0.note.localizedCaseInsensitiveContains(q)
-                || $0.project.localizedCaseInsensitiveContains(q)
-        }.prefix(50))
+    /// Newest first.
+    func load(_ newest: [ClipRow]) {
+        rows = newest
+        pendingByProject = [:]
+        for r in rows where !r.copied { pendingByProject[r.project, default: 0] += 1 }
+        pendingTotal = pendingByProject.values.reduce(0, +)
+        rebuildScopes()
+        let keep = selection
+        refilter()
+        selection = min(keep, max(items.count - 1, 0))
     }
 
-    func reload() {
-        rows = loadClips().filter { !isArchived($0) }.map(ClipRow.init).reversed()
-        selection = min(selection, max(items.count - 1, 0))
+    private func rebuildScopes() {
+        var names: [String] = home.map { [$0] } ?? []
+        var seen = Set(names)
+        for r in rows where seen.insert(r.project).inserted { names.append(r.project) }
+        scopes = names.map { Optional($0) } + [nil]
+    }
+
+    private func refilter() {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        defer { selection = 0 }
+        // Typing 34 or #34 jumps straight to that clip, in any project.
+        if let id = Int(q.hasPrefix("#") ? String(q.dropFirst()) : q), let hit = rows.first(where: { $0.id == id }) {
+            items = [hit]
+            return
+        }
+        var out: [ClipRow] = []
+        for r in rows where scope == nil || r.project == scope {
+            if q.isEmpty || r.cmd.localizedCaseInsensitiveContains(q) || r.note.localizedCaseInsensitiveContains(q)
+                || r.project.localizedCaseInsensitiveContains(q) {
+                out.append(r)
+                if out.count == 50 { break }
+            }
+        }
+        items = out
     }
 }
 
@@ -437,10 +565,12 @@ struct PickerView: View {
 final class PickerController {
     let model = PickerModel()
     let panel = FloatingPanel(focusable: true)
+    let store: ClipStore
     var keyMonitor: Any?
     var onCopied: ((Int, String) -> Void)?
 
-    init() {
+    init(store: ClipStore) {
+        self.store = store
         let host = ClickThroughHostingView(rootView: PickerView(model: model) { [weak self] id in self?.copy(id) })
         panel.contentView = host
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) {
@@ -450,12 +580,16 @@ final class PickerController {
 
     var isVisible: Bool { panel.isVisible }
 
+    func reload() {
+        store.refresh()
+        model.load(store.rows.reversed())
+    }
+
     func show(project: String?) {
         model.home = project
-        model.scope = project
         model.query = ""
-        model.reload()
-        model.selection = 0
+        reload()
+        model.scope = project
         let size = panel.contentView!.fittingSize
         let frame = screenWithMouse().visibleFrame
         panel.setFrame(NSRect(x: frame.midX - size.width / 2, y: frame.maxY - size.height - frame.height * 0.18,
@@ -501,7 +635,7 @@ final class PickerController {
             let id = items[model.selection].id
             if mods.contains(.option) {
                 archiveClips([id])
-                model.reload()
+                reload()
             } else {
                 copy(id)
             }
@@ -594,6 +728,7 @@ final class ToastController {
         dismiss?.cancel()
         clipID = nil
         panel.orderOut(nil)
+        panel.contentView = nil
     }
 }
 
@@ -602,10 +737,20 @@ final class ToastController {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
-    let picker = PickerController()
+    let store = ClipStore()
+    /// Built on first use so the SwiftUI picker costs nothing until it is opened.
+    lazy var picker: PickerController = {
+        let p = PickerController(store: store)
+        p.onCopied = { [weak self] id, cmd in self?.confirmCopy(id, cmd) }
+        return p
+    }()
+    var pickerLoaded = false
     let toast = ToastController()
-    var lastMtime: Date?
+    var watcher: StoreWatcher?
     var lastSeenID = 0
+    var badgeCount = -1
+    let badgeImages = (empty: NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "Agent Clipboard"),
+                       full: NSImage(systemSymbolName: "doc.on.clipboard.fill", accessibilityDescription: "Agent Clipboard"))
     /// Project of the front terminal tab, resolved when the menu opens or Terminal is activated.
     var activeProject: String?
     var filterSetting: String {
@@ -646,10 +791,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        lastSeenID = loadClips().map(clipID).max() ?? 0
+        statusItem.button?.imagePosition = .imageLeading
+        store.refresh()
+        lastSeenID = store.rows.map(\.id).max() ?? 0
         refreshBadge()
-        picker.onCopied = { [weak self] id, cmd in self?.confirmCopy(id, cmd) }
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.pollStore() }
+        watcher = StoreWatcher { [weak self] in self?.storeChanged() }
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -659,24 +805,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         registerHotKey(id: 2, keyCode: kVK_ANSI_C, modifiers: controlKey | optionKey) { [weak self] in self?.copyNewest() }
     }
 
-    func visibleClips(_ clips: [Clip]) -> [Clip] {
-        clips.filter { !isArchived($0) && (filter == allProjects || ($0["project"] as? String) == filter) }
+    var visibleRows: [ClipRow] {
+        filter == allProjects ? store.rows : store.rows.filter { $0.project == filter }
     }
 
-    func pollStore() {
-        let mtime = (try? FileManager.default.attributesOfItem(atPath: storeURL.path))?[.modificationDate] as? Date
-        guard mtime != lastMtime else { return }
-        lastMtime = mtime
-        let clips = loadClips()
-        let fresh = clips.filter { clipID($0) > lastSeenID && !isArchived($0) }
-        lastSeenID = max(lastSeenID, clips.map(clipID).max() ?? 0)
+    /// Any refresh may have absorbed the change already, so work from `lastSeenID`, not the refresh result.
+    func storeChanged() {
+        store.refresh()
+        let rows = store.rows
+        let fresh = rows.filter { $0.id > lastSeenID }
+        lastSeenID = max(lastSeenID, rows.last?.id ?? 0, fresh.map(\.id).max() ?? 0)
         refreshBadge()
-        if picker.isVisible { picker.model.reload() }
-        if let id = toast.clipID, clips.contains(where: { clipID($0) == id && (copyCount($0) > 0 || isArchived($0)) }) {
+        if pickerLoaded, picker.isVisible { picker.model.load(rows.reversed()) }
+        // Archived clips drop out of `rows`, so a missing clip counts as handled too.
+        if let id = toast.clipID, !rows.contains(where: { $0.id == id && !$0.copied }) {
             toast.hide()
         }
-        if toastsEnabled, let newest = fresh.last {
-            let row = ClipRow(newest)
+        if toastsEnabled, let row = fresh.last {
             let more = fresh.count > 1 ? "  (+\(fresh.count - 1) more)" : ""
             toast.show(title: "\(row.project) · #\(row.id)\(more)", cmd: row.cmd, note: row.note,
                        footer: "Click to copy  ·  ⌘⇧C picker  ·  ⌃⌥C copy newest", seconds: nil,
@@ -687,11 +832,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func refreshBadge() {
-        let pending = visibleClips(loadClips()).filter { copyCount($0) == 0 }.count
-        guard let button = statusItem.button else { return }
-        let symbol = pending > 0 ? "doc.on.clipboard.fill" : "doc.on.clipboard"
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Agent Clipboard")
-        button.imagePosition = .imageLeading
+        store.refresh()
+        let pending = visibleRows.reduce(0) { $0 + ($1.copied ? 0 : 1) }
+        guard pending != badgeCount, let button = statusItem.button else { return }
+        badgeCount = pending
+        button.image = pending > 0 ? badgeImages.full : badgeImages.empty
         button.title = pending > 0 ? " \(pending)" : ""
     }
 
@@ -713,9 +858,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func togglePicker() {
-        if picker.isVisible { picker.hide(); return }
+        if pickerLoaded, picker.isVisible { picker.hide(); return }
         // Clicking the icon while the picker is open closes it via resign-key first; don't reopen.
-        if Date().timeIntervalSince(picker.lastHidden) < 0.3 { return }
+        if pickerLoaded, Date().timeIntervalSince(picker.lastHidden) < 0.3 { return }
+        pickerLoaded = true
         // Draw immediately with the last known project; correct it if the front tab differs.
         picker.show(project: filter == allProjects ? nil : filter)
         DispatchQueue.main.async { [weak self] in
@@ -724,7 +870,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let project = self.filter == allProjects ? nil : self.filter
                 self.picker.model.home = project
                 self.picker.model.scope = project
-                self.picker.model.selection = 0
                 self.refreshBadge()
             }
         }
@@ -733,12 +878,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Newest uncopied clip in the current filter, else the newest one.
     func copyNewest() {
         resolveActiveProject()
-        let shown = visibleClips(loadClips())
-        guard let clip = shown.last(where: { copyCount($0) == 0 }) ?? shown.last else {
+        store.refresh()
+        let shown = visibleRows
+        guard let row = shown.last(where: { !$0.copied }) ?? shown.last else {
             toast.show(title: "Nothing queued", cmd: filter == allProjects ? "" : filter, seconds: 1.6)
             return
         }
-        if let cmd = copyClip(id: clipID(clip)) { confirmCopy(clipID(clip), cmd) }
+        if let cmd = copyClip(id: row.id) { confirmCopy(row.id, cmd) }
     }
 
     // Rebuild on every open so the menu always reflects the file.
@@ -746,11 +892,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         resolveActiveProject()
         refreshBadge()
-        let clips = loadClips()
-        let shown = visibleClips(clips)
-
-        let projectCounts = Dictionary(grouping: clips.filter { !isArchived($0) }) { ($0["project"] as? String) ?? "?" }
-            .mapValues(\.count)
+        let shown = visibleRows
+        let projectCounts = Dictionary(grouping: store.rows, by: \.project).mapValues(\.count)
         let label = filter == allProjects ? "All" : filter
         let filterItem = NSMenuItem(title: "Project: \(label)\(filterSetting == autoProject ? "  (auto)" : "")", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -781,23 +924,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             empty.isEnabled = false
             menu.addItem(empty)
         }
-        for clip in shown.suffix(menuLimit).reversed() {
-            let cmd = (clip["cmd"] as? String) ?? ""
-            let project = (clip["project"] as? String) ?? ""
-            let note = (clip["note"] as? String) ?? ""
-            let prefix = "#\(clipID(clip))  " + (filter == allProjects ? "[\(project)]  " : "")
+        for row in shown.suffix(menuLimit).reversed() {
+            let (cmd, note) = (row.cmd, row.note)
+            let prefix = "#\(row.id)  " + (filter == allProjects ? "[\(row.project)]  " : "")
 
             let item = NSMenuItem(title: prefix + preview(cmd), action: #selector(copyMenuClip(_:)), keyEquivalent: "")
             item.target = self
-            item.tag = clipID(clip)
-            item.state = copyCount(clip) > 0 ? .on : .off
+            item.tag = row.id
+            item.state = row.copied ? .on : .off
             if !note.isEmpty, #available(macOS 14.4, *) { item.subtitle = note }
             item.toolTip = (note.isEmpty ? "" : note + "\n\n") + cmd
             menu.addItem(item)
 
             let alt = NSMenuItem(title: "Archive: " + preview(cmd), action: #selector(archiveClip(_:)), keyEquivalent: "")
             alt.target = self
-            alt.tag = clipID(clip)
+            alt.tag = row.id
             alt.isAlternate = true
             alt.keyEquivalentModifierMask = .option
             menu.addItem(alt)
@@ -838,20 +979,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func copyNewestAction() { copyNewest() }
     @objc func toggleToasts() { toastsEnabled.toggle() }
 
-    func archive(where pred: (Clip) -> Bool) {
-        archiveClips(Set(loadClips().filter(pred).map(clipID)))
+    func archive(_ ids: Set<Int>) {
+        guard !ids.isEmpty else { return }
+        archiveClips(ids)
         refreshBadge()
     }
 
-    @objc func archiveClip(_ sender: NSMenuItem) { archive { clipID($0) == sender.tag } }
-    @objc func archiveCopied() {
-        let ids = Set(visibleClips(loadClips()).filter { copyCount($0) > 0 }.map(clipID))
-        archive { ids.contains(clipID($0)) }
-    }
-    @objc func archiveAllShown() {
-        let ids = Set(visibleClips(loadClips()).map(clipID))
-        archive { ids.contains(clipID($0)) }
-    }
+    @objc func archiveClip(_ sender: NSMenuItem) { archive([sender.tag]) }
+    @objc func archiveCopied() { archive(Set(visibleRows.filter(\.copied).map(\.id))) }
+    @objc func archiveAllShown() { archive(Set(visibleRows.map(\.id))) }
     @objc func openLog() { NSWorkspace.shared.open(storeURL) }
     @objc func quit() { NSApp.terminate(nil) }
 }

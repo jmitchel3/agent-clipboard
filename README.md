@@ -45,7 +45,7 @@ Right-click the menu bar icon for settings: project filter, toast on/off, bulk a
 
 ## Install
 
-Requires macOS 14+ and the Xcode command line tools (`xcode-select --install`).
+Requires macOS 14+, the Xcode command line tools (`xcode-select --install`) and Rust (`brew install rust`).
 
 ```bash
 git clone https://github.com/jmitchel3/agent-clipboard.git
@@ -54,7 +54,7 @@ cd agent-clipboard
 echo "source $PWD/shell/agent-clip.zsh" >> ~/.zshrc   # optional: the `ac` command
 ```
 
-`install.sh` builds `~/Applications/Agent Clipboard.app`, links `agent-clip` into `~/.local/bin`, and registers a LaunchAgent so the app starts at login. Re-run it after pulling changes.
+`install.sh` builds `~/Applications/Agent Clipboard.app`, builds and installs `agent-clip` into `~/.local/bin`, and registers a LaunchAgent so the app starts at login. Re-run it after pulling changes.
 
 The first time the picker reads your Terminal tab, macOS asks to let Agent Clipboard control Terminal. Allow it, or project detection falls back to showing all projects.
 
@@ -86,6 +86,7 @@ writable_roots = ["/Users/you/.agent-clipboard"]
 
 ```bash
 agent-clip add -n "note" <<'EOF'      # queue a command (stdin), or: agent-clip add -- cmd args
+                                      # an identical command still pending in the project is not queued twice
 agent-clip ls [-p project] [-a]       # list (-a includes archived)
 agent-clip show 12                    # print the full command
 agent-clip copy [12]                  # copy to the macOS clipboard (default: newest)
@@ -114,9 +115,9 @@ Repeated command shapes (alias / script candidates):
 
 ## How it works
 
-- **Store:** `~/.agent-clipboard/clips.jsonl`, one JSON object per clip (`id`, `ts`, `project`, `cwd`, `agent`, `note`, `cmd`, `copies`, `archived`). Writers share an `flock`; rewrites are atomic. Set `AGENT_CLIPBOARD_DIR` to move it.
-- **CLI:** `bin/agent-clip`, a single Python 3 file with no dependencies.
-- **App:** `app/AgentClipboard.swift`, a single-file AppKit + SwiftUI menu bar app. Hotkeys use Carbon `RegisterEventHotKey`, so no Accessibility permission is needed. Front-tab detection asks Terminal for the tab's tty over AppleScript, then reads the shell's working directory with `libproc`.
+- **Store:** `~/.agent-clipboard/clips.jsonl`, one JSON object per clip (`id`, `ts`, `project`, `cwd`, `agent`, `note`, `cmd`, `copies`, `archived`). Writers share an `flock`; `add` appends, other writes rewrite atomically, and lines that fail to parse are kept verbatim. Set `AGENT_CLIPBOARD_DIR` to move it.
+- **CLI:** `cli/`, a small Rust binary (about 3 ms per command). Project detection reads `.git` directly instead of spawning git.
+- **App:** `app/AgentClipboard.swift`, a single-file AppKit + SwiftUI menu bar app. Hotkeys use Carbon `RegisterEventHotKey`, so no Accessibility permission is needed. Front-tab detection asks Terminal for the tab's tty with one raw Apple Event (no AppleScript interpreter loaded), then reads the shell's working directory with `libproc`. The app watches the store with kqueue rather than polling, and only reparses it when it changes.
 
 ## Uninstall
 

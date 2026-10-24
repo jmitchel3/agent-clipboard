@@ -10,7 +10,11 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 mkdir -p "$APP/Contents/MacOS" "$BIN_DIR" "$HOME/Library/LaunchAgents" "$HOME/.agent-clipboard"
 
+command -v cargo >/dev/null || { echo "install.sh: Rust is required (brew install rust)" >&2; exit 1; }
+cargo build --release --quiet --manifest-path "$ROOT/cli/Cargo.toml"
+
 swiftc -O -o "$APP/Contents/MacOS/AgentClipboard" "$ROOT/app/AgentClipboard.swift"
+strip -x "$APP/Contents/MacOS/AgentClipboard"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -30,8 +34,9 @@ cat > "$APP/Contents/Info.plist" <<EOF
 EOF
 codesign --force --sign - "$APP" >/dev/null 2>&1
 
-ln -sf "$ROOT/bin/agent-clip" "$BIN_DIR/agent-clip"
-chmod +x "$ROOT/bin/agent-clip"
+# Copied, not linked, so `cargo clean` or deleting the checkout doesn't break the command.
+rm -f "$BIN_DIR/agent-clip"
+install -m 755 "$ROOT/cli/target/release/agent-clip" "$BIN_DIR/agent-clip"
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
